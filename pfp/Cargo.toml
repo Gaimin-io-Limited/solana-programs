@@ -1,0 +1,18 @@
+[package]
+name = "gaimin-staking"
+version = "0.1.0"
+edition = "2021"
+license = "WTFPL"
+publish = false
+
+[dependencies]
+arrayref = "0.3.7"
+solana-program = "1.17.13"
+spl-token = {version = "4.0.0", features = ["no-entrypoint"]}
+thiserror = "1.0.52"
+
+[features]
+test-bpf = []
+
+[lib]
+crate-type = ["cdylib", "lib"]
