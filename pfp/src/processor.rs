@@ -1,377 +1,386 @@
-use solana_program::{
-    account_info::{next_account_info, AccountInfo},
-    clock::{Clock, UnixTimestamp},
-    entrypoint::ProgramResult,
-    msg,
-    program::invoke_signed,
-    program_error::ProgramError,
-    program_pack::{IsInitialized, Pack},
-    pubkey::Pubkey,
-    rent::Rent,
-    sysvar::Sysvar,
+use mpl_token_metadata::{
+    accounts::{Metadata, TokenRecord},
+    types::{TokenStandard, TokenState},
 };
+
+use solana_program::{
+    account_info::AccountInfo, clock::Clock, entrypoint::ProgramResult, msg,
+    program::invoke_signed, program_error::ProgramError, program_pack::Pack, pubkey,
+    pubkey::Pubkey, sysvar::Sysvar,
+};
+
 use spl_token::state::{Account, Mint};
 
 use crate::{
-    instruction::GaiminInstruction,
-    state::{ClaimRecord, Config, NftRecord}, error::GaiminError,
+    error::GaiminError,
+    instruction::{accounts::*, ClaimArgs, ConfigArgs, CreateClaimArgs, GaiminInstruction},
+    state::{ClaimRecord, Config, NftRecord},
+    utils::*,
 };
 
-const CONFIG_PDA_SEED: &[u8] = b"config";
-const NFT_PDA_SEED: &[u8] = b"nft";
-const CLAIM_PDA_SEED: &[u8] = b"claim";
+pub const CONFIG_PDA_SEED: &[u8] = b"config";
+pub const NFT_PDA_SEED: &[u8] = b"nft";
+pub const CLAIM_PDA_SEED: &[u8] = b"claim";
+pub const MPL_TOKEN_METADATA_PROGRAM_ID: Pubkey =
+    pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+pub const SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID: Pubkey =
+    pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
 pub struct Processor;
 
 impl Processor {
-    pub fn process(
+    pub fn process<'a>(
         program_id: &Pubkey,
-        accounts: &[AccountInfo],
+        accounts: &'a [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
         let instruction = GaiminInstruction::unpack(instruction_data)?;
 
         msg!("Processing instruction: {:?}", instruction);
         match instruction {
-            GaiminInstruction::SetConfig {
-                claimable_from,
-                total_reward,
-                initial_reward_frac,
-                reward_period_sec,
-            } => Self::set_config(
+            GaiminInstruction::Config(data) => Self::process_config(
                 program_id,
-                accounts,
-                claimable_from,
-                total_reward,
-                initial_reward_frac,
-                reward_period_sec,
+                ConfigAccounts::context(accounts)?.accounts,
+                data,
             ),
-            GaiminInstruction::RegisterNft => Self::register_nft(program_id, accounts),
-            GaiminInstruction::ClaimReward {
-                bnb_chain_wallet_address,
-            } => Self::claim_reward(program_id, accounts, &bnb_chain_wallet_address),
+            GaiminInstruction::Delete => {
+                Self::process_delete(program_id, DeleteAccounts::context(accounts)?.accounts)
+            }
+            GaiminInstruction::Nft => {
+                Self::process_nft(program_id, NftAccounts::context(accounts)?.accounts)
+            }
+            GaiminInstruction::CreateClaim(data) => Self::process_create_claim(
+                program_id,
+                CreateClaimAccounts::context(accounts)?.accounts,
+                data,
+            ),
+            GaiminInstruction::Claim(data) => {
+                Self::process_claim(program_id, ClaimAccounts::context(accounts)?.accounts, data)
+            }
         }
     }
 
-    fn set_config(
+    fn process_config(
         program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        claimable_from: UnixTimestamp,
-        total_reward: f64,
-        initial_reward_frac: f32,
-        reward_period_sec: i32,
+        accounts: ConfigAccounts,
+        data: ConfigArgs,
     ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
+        // Authority validation
+        assert_signer(accounts.authority)?;
 
-        let auth_acc = next_account_info(account_info_iter).filter(
-            |acc| acc.is_signer,
-            |_| ProgramError::MissingRequiredSignature,
-        )?;
+        // Config validation
+        let bump = assert_derived_from(accounts.config, program_id, &[CONFIG_PDA_SEED])?;
+        assert_uninitialized(accounts.config)?;
 
-        let (config_pda_acc, config_bump) = Self::validate_pda(
-            next_account_info(account_info_iter)?,
-            &[CONFIG_PDA_SEED],
-            program_id,
-        )?;
+        let accumulation_duration = data.total_accumulation_period / data.accumulated_reward;
 
-        if **config_pda_acc.try_borrow_lamports()? == 0 {
-            msg!("Creating config account");
-            invoke_signed(
-                &solana_program::system_instruction::create_account(
-                    auth_acc.key,
-                    config_pda_acc.key,
-                    Rent::default().minimum_balance(Config::LEN),
-                    Config::LEN as u64,
-                    program_id,
-                ),
-                &[auth_acc.clone(), config_pda_acc.clone()],
-                &[&[CONFIG_PDA_SEED, &[config_bump]]],
-            )?;
+        if data.accumulated_reward < 0
+            || data.initial_reward < 0
+            || accumulation_duration <= 0
+            || data.generation_duration < 0
+        {
+            msg!("[Error] Config data is invalid");
+            return Err(GaiminError::InvalidConfig.into());
         }
 
-        Config::unpack_unchecked(&config_pda_acc.try_borrow_data()?).filter(
-            |config| !config.is_initialized() || &config.authority == auth_acc.key,
-            |config| {
-                msg!("[Error] Permission to edit initialized config denied. Expected authority {:?}, received {:?}", config.authority, auth_acc.key);
-                GaiminError::PermissionDenied.into()
-            }
+        data.initial_reward
+            .checked_add(data.accumulated_reward)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        // Config creation
+        invoke_signed(
+            &create_account_ix::<Config>(accounts.config.key, accounts.authority.key, program_id),
+            &[accounts.authority.clone(), accounts.config.clone()],
+            &[&[CONFIG_PDA_SEED, &[bump]]],
         )?;
 
         Config::pack(
             Config {
-                authority: *auth_acc.key,
-                claimable_from,
-                total_reward,
-                initial_reward_frac,
-                reward_period_sec,
+                authority: *accounts.authority.key,
+                creator: *accounts.creator.key,
+                claimable_from: data.claimable_from,
+                accumulated_reward: data.accumulated_reward,
+                initial_reward: data.initial_reward,
+                accumulation_duration,
+                generation_duration: data.generation_duration,
             },
-            &mut config_pda_acc.try_borrow_mut_data()?,
+            &mut accounts.config.try_borrow_mut_data()?,
         )?;
 
         Ok(())
     }
 
-    fn register_nft(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
+    fn process_delete(program_id: &Pubkey, accounts: DeleteAccounts) -> ProgramResult {
+        // Config validation
+        assert_derived_from(accounts.config, program_id, &[CONFIG_PDA_SEED])?;
+        assert_initialized(accounts.config)?;
 
-        let auth_acc = next_account_info(account_info_iter).filter(
-            |acc| acc.is_signer,
-            |_| ProgramError::MissingRequiredSignature,
-        )?;
+        // Authority validation
+        assert_signer(accounts.authority)?;
+        let config = Config::unpack_unchecked(&accounts.config.try_borrow_data()?)?;
+        if config.authority != *accounts.authority.key {
+            return Err(GaiminError::PermissionDenied.into());
+        }
 
-        let nft_acc = next_account_info(account_info_iter)
-            .filter(
-                |acc| *acc.owner == spl_token::id(),
-                |acc| {
-                    msg!("[Error] {:?} is not a valid NFT (account owner is not the Token Program)", acc.key);
-                    ProgramError::InvalidAccountOwner
-                }
-            )
-            .and_then(|acc| {
-                Mint::unpack_unchecked(&acc.try_borrow_data()?)
-                    .filter(
-                        |mint| {
-                            mint.supply == 1 && mint.decimals == 0 && mint.mint_authority.is_none()
-                        },
-                        |_| {
-                            msg!("[Error] {:?} is not a valid NFT (token is fungible)", acc.key);
-                            ProgramError::InvalidAccountData
-                        }
-                    )
-                    .and(Ok(acc))
-            })?;
+        delete_account(accounts.target, accounts.receiver)
+    }
 
-        let nft_seeds = &[NFT_PDA_SEED, &nft_acc.key.to_bytes()];
-        let (nft_pda_acc, nft_bump) =
-            Self::validate_pda(next_account_info(account_info_iter)?, nft_seeds, program_id)?;
-        Self::ensure_uninitialized(nft_pda_acc)?;
+    fn process_nft(program_id: &Pubkey, accounts: NftAccounts) -> ProgramResult {
+        // Config validation
+        assert_derived_from(accounts.config, program_id, &[CONFIG_PDA_SEED])?;
+        assert_initialized(accounts.config)?;
 
-        let (config_pda_acc, _) = Self::validate_pda(
-            next_account_info(account_info_iter)?,
-            &[CONFIG_PDA_SEED],
+        let config = Config::unpack_unchecked(&accounts.config.try_borrow_data()?)?;
+
+        // Authority validation
+        assert_signer(accounts.payer)?;
+
+        // NFT Record validation
+        let bump = assert_derived_from(
+            accounts.nft_record,
             program_id,
+            &[NFT_PDA_SEED, &accounts.mint.key.to_bytes()],
         )?;
-        Self::ensure_initialized(config_pda_acc)?;
+        if is_initialized(accounts.nft_record)? {
+            return Ok(());
+        }
 
-        let config = Config::unpack_unchecked(&config_pda_acc.try_borrow_data()?).filter(
-            |config| &config.authority == auth_acc.key,
-            |config| {
-                msg!("[Error] Permission to register NFT denied. Expected authority {:?}, received {:?}", config.authority, auth_acc.key);
-                GaiminError::PermissionDenied.into()
-            }
+        // Mint/Edition validation
+        if *accounts.mint.owner != spl_token::id() {
+            msg!("[Error] Mint address is not owned by the Token Program");
+            return Err(GaiminError::InvalidNft.into());
+        }
+
+        assert_derived_from(
+            accounts.edition,
+            &MPL_TOKEN_METADATA_PROGRAM_ID,
+            &[
+                b"metadata",
+                &MPL_TOKEN_METADATA_PROGRAM_ID.to_bytes(),
+                &accounts.mint.key.to_bytes(),
+                b"edition",
+            ],
+        )?;
+        assert_initialized(accounts.edition)?;
+
+        let mint = Mint::unpack_unchecked(&accounts.mint.try_borrow_data()?)?;
+        if !mint.mint_authority.contains(accounts.edition.key) {
+            msg!("[Error] Unexpected mint authority");
+            return Err(GaiminError::InvalidNft.into());
+        }
+
+        // Metadata validation
+        assert_derived_from(
+            accounts.metadata,
+            &MPL_TOKEN_METADATA_PROGRAM_ID,
+            &[
+                b"metadata",
+                &MPL_TOKEN_METADATA_PROGRAM_ID.to_bytes(),
+                &accounts.mint.key.to_bytes(),
+            ],
         )?;
 
-        msg!("Creating NFT PDA Account");
+        let metadata = Metadata::safe_deserialize(&accounts.metadata.try_borrow_data()?)?;
+        let token_standard = metadata
+            .token_standard
+            .ok_or(GaiminError::InvalidTokenStandard)?;
+        match token_standard {
+            TokenStandard::ProgrammableNonFungible => (),
+            TokenStandard::ProgrammableNonFungibleEdition => (),
+            _ => return Err(GaiminError::InvalidTokenStandard.into()),
+        }
+
+        let valid_creator = metadata.creators.map_or(false, |creators| {
+            creators
+                .iter()
+                .any(|creator| creator.verified && creator.address == config.creator)
+        });
+        if !valid_creator && &config.authority != accounts.payer.key {
+            return Err(GaiminError::InvalidCreator.into());
+        }
+
+        // Account creation
         invoke_signed(
-            &solana_program::system_instruction::create_account(
-                auth_acc.key,
-                nft_pda_acc.key,
-                Rent::default().minimum_balance(NftRecord::LEN),
-                NftRecord::LEN as u64,
+            &create_account_ix::<NftRecord>(
+                accounts.nft_record.key,
+                accounts.payer.key,
                 program_id,
             ),
-            &[auth_acc.clone(), nft_pda_acc.clone()],
-            &[&[NFT_PDA_SEED, &nft_acc.key.to_bytes(), &[nft_bump]]],
+            &[accounts.payer.clone(), accounts.nft_record.clone()],
+            &[&[NFT_PDA_SEED, &accounts.mint.key.to_bytes(), &[bump]]],
         )?;
 
         NftRecord::pack(
             NftRecord {
-                nonce: 0,
-                claimed_amount: 0.0,
-                total_amount: config.total_reward,
-                last_claim_at: 0,
+                claimed_amount: 0,
+                total_amount: config.initial_reward + config.accumulated_reward,
+                last_claim_at: config.claimable_from,
             },
-            &mut nft_pda_acc.try_borrow_mut_data()?,
+            &mut accounts.nft_record.try_borrow_mut_data()?,
         )?;
 
         Ok(())
     }
 
-    fn claim_reward(
+    fn process_create_claim(
         program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        bnb_chain_wallet_address: &[u8; 40],
+        accounts: CreateClaimAccounts,
+        data: CreateClaimArgs,
     ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
+        // User wallet validation
+        assert_signer(accounts.wallet)?;
 
-        let user_acc = next_account_info(account_info_iter).filter(
-            |acc| acc.is_signer,
-            |_| ProgramError::MissingRequiredSignature,
-        )?;
+        // Config validation
+        assert_derived_from(accounts.config, program_id, &[CONFIG_PDA_SEED])?;
+        assert_initialized(accounts.config)?;
 
-        let nft_acc = next_account_info(account_info_iter)?;
+        // Claim record validation
+        let claim_seeds_with_bump = &[
+            CLAIM_PDA_SEED,
+            &accounts.wallet.key.to_bytes(),
+            &data.seed,
+            &[data.bump],
+        ];
+        assert_derived_from_with_bump(accounts.claim, program_id, claim_seeds_with_bump)?;
+        assert_uninitialized(accounts.claim)?;
 
-        let _token_acc = next_account_info(account_info_iter)
-            .filter(
-                |acc| *acc.owner == spl_token::id(),
-                |acc| {
-                    msg!("[Error] Account {:?} is not a token account", acc.key);
-                    ProgramError::InvalidAccountOwner
-                }
-            )
-            .and_then(|acc| {
-                Account::unpack_unchecked(&acc.try_borrow_data()?)
-                    .filter(
-                        |token_acc| &token_acc.owner == user_acc.key,
-                        |_| {
-                            msg!("[Error] Token account {:?} does not belong to wallet {:?}", acc.key, user_acc.key);
-                            GaiminError::PermissionDenied.into()
-                        }
-                    )
-                    .filter(
-                        |token_acc| &token_acc.mint == nft_acc.key && token_acc.amount > 0,
-                        |_| {
-                            msg!("[Error] Token account {:?} does not hold tokens of mint {:?}", acc.key, nft_acc.key);
-                            GaiminError::PermissionDenied.into()
-                        }
-                    )
-            })?;
-
-        let nft_seeds = &[NFT_PDA_SEED, &nft_acc.key.to_bytes()];
-        let (nft_pda_acc, _) =
-            Self::validate_pda(next_account_info(account_info_iter)?, nft_seeds, program_id)?;
-        Self::ensure_initialized(nft_pda_acc)?;
-
-        let nft_record = NftRecord::unpack_unchecked(&nft_pda_acc.try_borrow_data()?)?;
-
-        let nonce_seed = &(nft_record.nonce + 1).to_le_bytes();
-        let claim_seeds = &[CLAIM_PDA_SEED, &nft_acc.key.to_bytes(), nonce_seed];
-        let (claim_pda_acc, claim_bump) = Self::validate_pda(
-            next_account_info(account_info_iter)?,
-            claim_seeds,
-            program_id,
-        )?;
-        Self::ensure_uninitialized(claim_pda_acc)?;
-
-        let (config_pda_acc, _) = Self::validate_pda(
-            next_account_info(account_info_iter)?,
-            &[CONFIG_PDA_SEED],
-            program_id,
-        )?;
-
-        let config = Config::unpack_unchecked(&config_pda_acc.try_borrow_data()?)?;
-        let now = Clock::get()
-            .filter(
-                |now| now.unix_timestamp >= config.claimable_from,
-                |now| {
-                    msg!("[Error] Claiming is only available from {:?}", now.unix_timestamp);
-                    GaiminError::ClaimingNotAvailable.into()
-                }
-            )?
-            .unix_timestamp;
-
+        // Claim record creation
         invoke_signed(
-            &solana_program::system_instruction::create_account(
-                user_acc.key,
-                claim_pda_acc.key,
-                Rent::default().minimum_balance(ClaimRecord::LEN),
-                ClaimRecord::LEN as u64,
-                program_id,
-            ),
-            &[user_acc.clone(), claim_pda_acc.clone()],
-            &[&[
-                CLAIM_PDA_SEED,
-                &nft_acc.key.to_bytes(),
-                nonce_seed,
-                &[claim_bump],
-            ]],
+            &create_account_ix::<ClaimRecord>(accounts.claim.key, accounts.wallet.key, program_id),
+            &[accounts.wallet.clone(), accounts.claim.clone()],
+            &[claim_seeds_with_bump],
         )?;
 
-        let mut nft_record = NftRecord::unpack_unchecked(&nft_pda_acc.try_borrow_mut_data()?)
-            .filter(
-                |rec| rec.claimed_amount < rec.total_amount,
-                |_| {
-                    msg!("[Error] No claimable amount left");
-                    GaiminError::AmountExhausted.into()
-                }
-            )?;
-
-        let reward = if nft_record.last_claim_at == 0 {
-            config.initial_reward_frac as f64 * nft_record.total_amount
-        } else {
-            let time_since_last_claim = now - nft_record.last_claim_at;
-            let reward_per_sec = ((1.0 - config.initial_reward_frac as f64)
-                * nft_record.total_amount)
-                / config.reward_period_sec as f64;
-            let reward_by_time = time_since_last_claim as f64 * reward_per_sec;
-            f64::min(
-                nft_record.total_amount - nft_record.claimed_amount,
-                reward_by_time,
-            )
-        };
-
-        nft_record.last_claim_at = now;
-        nft_record.claimed_amount += reward;
-        nft_record.nonce += 1;
-        NftRecord::pack(nft_record, &mut nft_pda_acc.try_borrow_mut_data()?)?;
+        let config = Config::unpack_unchecked(&accounts.config.try_borrow_data()?)?;
+        let now = Clock::get()?.unix_timestamp as i32;
 
         ClaimRecord::pack(
             ClaimRecord {
-                claimed_amount: reward,
-                bnb_chain_wallet_address: *bnb_chain_wallet_address,
+                generation: now / config.generation_duration,
+                amount: 0,
+                owner: *accounts.wallet.key,
+                bnb_chain_wallet_address: data.bnb_chain_wallet_address,
             },
-            &mut claim_pda_acc.try_borrow_mut_data()?,
+            &mut accounts.claim.try_borrow_mut_data()?,
         )?;
 
         Ok(())
     }
 
-    fn ensure_uninitialized<'a, 'b>(
-        acc: &'a AccountInfo<'b>,
-    ) -> Result<&'a AccountInfo<'b>, ProgramError> {
-        acc.try_borrow_lamports()
-            .filter(
-                |lamports| ***lamports == 0,
-                |_| {
-                    msg!("[Error] Account {:?} must NOT be initialized", acc.key);
-                    ProgramError::AccountAlreadyInitialized
-                }
-            )
-            .and(Ok(acc))
-    }
-
-    fn ensure_initialized<'a, 'b>(
-        acc: &'a AccountInfo<'b>,
-    ) -> Result<&'a AccountInfo<'b>, ProgramError> {
-        acc.try_borrow_lamports()
-            .filter(
-                |lamports| ***lamports > 0,
-                |_| {
-                    msg!("[Error] Account {:?} must be initialized", acc.key);
-                    ProgramError::UninitializedAccount
-                }
-            )
-            .and(Ok(acc))
-    }
-
-    fn validate_pda<'a, 'b>(
-        acc: &'a AccountInfo<'b>,
-        seeds: &[&[u8]],
+    fn process_claim(
         program_id: &Pubkey,
-    ) -> Result<(&'a AccountInfo<'b>, u8), ProgramError> {
-        let (pda, bump) = Pubkey::find_program_address(seeds, program_id);
-        if acc.key != &pda {
-            msg!("[Error] Account {:?} is not a PDA derived from program ID {:?} and seeds {:?}", acc.key, program_id, seeds);
-            Err(ProgramError::InvalidSeeds)
-        } else {
-            Ok((acc, bump))
+        accounts: ClaimAccounts,
+        data: ClaimArgs,
+    ) -> ProgramResult {
+        // User wallet validation
+        assert_signer(accounts.wallet)?;
+
+        // Token account validation
+        if *accounts.token.owner != spl_token::id() {
+            msg!("[Error] Token account does not belong to the Token Program");
+            return Err(GaiminError::InvalidTokenAccount.into());
         }
-    }
-}
 
-trait Filter<T, E> {
-    fn filter<F, G>(self, pred: F, err_get: G) -> Self
-    where
-        F: FnOnce(&T) -> bool,
-        G: FnOnce(&T) -> E;
-}
+        let token = Account::unpack_unchecked(&accounts.token.try_borrow_data()?)?;
 
-impl<T, E> Filter<T, E> for Result<T, E> {
-    fn filter<F, G>(self, pred: F, err_get: G) -> Self
-    where
-        F: FnOnce(&T) -> bool,
-        G: FnOnce(&T) -> E,
-    {
-        self.and_then(|t| if pred(&t) { Ok(t) } else { Err(err_get(&t)) })
+        assert_derived_from_with_bump(
+            accounts.token,
+            &SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID,
+            &[
+                &accounts.wallet.key.to_bytes(),
+                &spl_token::ID.to_bytes(),
+                &token.mint.to_bytes(),
+                &[data.token_acc_bump],
+            ],
+        )?;
+
+        if &token.owner != accounts.wallet.key {
+            msg!("[Error] Token account does not belong to the user");
+            return Err(GaiminError::InvalidTokenAccount.into());
+        } else if token.amount == 0 {
+            msg!("[Error] Token account does not hold the NFT");
+            return Err(GaiminError::ZeroNftBalance.into());
+        }
+
+        // Token record validation
+        assert_derived_from_with_bump(
+            accounts.token_record,
+            &MPL_TOKEN_METADATA_PROGRAM_ID,
+            &[
+                b"metadata",
+                &MPL_TOKEN_METADATA_PROGRAM_ID.to_bytes(),
+                &token.mint.to_bytes(),
+                b"token_record",
+                &accounts.token.key.to_bytes(),
+                &[data.token_record_bump],
+            ],
+        )?;
+
+        let token_record =
+            TokenRecord::safe_deserialize(&accounts.token_record.try_borrow_data()?)?;
+        if token_record.state != TokenState::Locked {
+            msg!("[Error] Token account is unlocked");
+            return Err(GaiminError::TokenAccountUnlocked.into());
+        }
+
+        // Config validation
+        assert_derived_from(accounts.config, program_id, &[CONFIG_PDA_SEED])?;
+        assert_initialized(accounts.config)?;
+
+        let config = Config::unpack_unchecked(&accounts.config.try_borrow_data()?)?;
+        let now = Clock::get()?.unix_timestamp as i32;
+
+        if now < config.claimable_from {
+            msg!("[Error] Claiming is not available yet");
+            return Err(GaiminError::ClaimingNotAvailable.into());
+        }
+
+        // NFT record validation
+        assert_derived_from_with_bump(
+            accounts.nft_record,
+            program_id,
+            &[
+                NFT_PDA_SEED,
+                &token.mint.to_bytes(),
+                &[data.nft_record_bump],
+            ],
+        )?;
+        assert_initialized(accounts.nft_record)?;
+
+        let mut nft_record = NftRecord::unpack_unchecked(&accounts.nft_record.try_borrow_data()?)?;
+        if nft_record.claimed_amount >= nft_record.total_amount {
+            msg!("[Error] No claimable amount left");
+            return Err(GaiminError::AmountExhausted.into());
+        }
+
+        // Claim record validation
+        assert_initialized(accounts.claim)?;
+
+        let mut claim = ClaimRecord::unpack_unchecked(*accounts.claim.try_borrow_data()?)?;
+
+        if &claim.owner != accounts.wallet.key {
+            msg!("[Error] Claim record doesn't belong to this wallet");
+            return Err(GaiminError::PermissionDenied.into());
+        }
+
+        // Reward calculation
+        let base_reward = if nft_record.claimed_amount == 0 { config.initial_reward } else { 0 };
+        let stake_duration = now - nft_record.last_claim_at;
+        let reward = i32::min(
+            nft_record.total_amount - nft_record.claimed_amount,
+            base_reward + (stake_duration / config.accumulation_duration),
+        );
+
+        claim.amount += reward;
+
+        // Claim update
+        ClaimRecord::pack(claim, &mut accounts.claim.try_borrow_mut_data()?)?;
+
+        // NFT record update
+        nft_record.last_claim_at = now;
+        nft_record.claimed_amount += reward;
+        NftRecord::pack(nft_record, &mut accounts.nft_record.try_borrow_mut_data()?)?;
+
+        Ok(())
     }
 }
